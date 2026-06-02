@@ -1,0 +1,308 @@
+classdef MUSIC2D
+    properties
+        nSubcarriers(1, 1)  {mustBeInteger, mustBeNonnegative}
+        mSymbols(1, 1)      {mustBeInteger, mustBeNonnegative}
+        lagN(1, 1)          {mustBeInteger, mustBeNonnegative}
+        lagM(1, 1)          {mustBeInteger, mustBeNonnegative}
+        distanceSearchSpace
+        velocitySearchSpace
+        peakProminence      {mustBeNonnegative}
+        FBLn
+        FBLm
+        modelOrderThreshold {mustBeNonnegative}
+        maxOrder
+        decimationFactor    {mustBeInteger, mustBeNonnegative}
+    end
+
+    methods
+        function obj = MUSIC2D(nSubcarriers, mSymbols, lagN, lagM, ...
+                distanceSearchSpace, velocitySearchSpace, peakProminence, ...
+                FBLn, FBLm, orderThreshold, maxOrder, decimationFactor)
+            % MUSIC2D Creates a MUSIC2D object
+            % obj = MUSIC2D(...) creates the MUSIC2D object with the
+            % specified parameters
+            %
+            % Inputs:
+            %       nSubcarriers        : number of subcarriers to be used
+            %       mSymblols           : number of symbols to be used
+            %       lagN                : size of subarray for rows
+            %       lagM                : size of subarray for columns
+            %       distanceSearchSpace : search space for distance
+            %       velocitySearchSpace : search space for velocity
+            %       peakPromincence     : prominence for pseudospectrum
+            %                             peak search
+            %       FBLn                : rows of 2D full-back averaged
+            %                             matrix
+            %       FBLm                : columns of 2D full-back averaged
+            %                             matrix
+            %       orderThreshold      : threshold for model order
+            %                             estimation
+            %       decimationFactor    : subsampling factor for 1D peak
+            %                             matching
+            % Output:
+            %       obj: MUSIC2D object            
+            obj.nSubcarriers = nSubcarriers;
+            obj.mSymbols = mSymbols;
+            obj.lagN = lagN;
+            obj.lagM = lagM;
+            obj.distanceSearchSpace = distanceSearchSpace;
+            obj.velocitySearchSpace = velocitySearchSpace;
+            obj.peakProminence = peakProminence;
+            obj.FBLn = FBLn;
+            obj.FBLm = FBLm;
+            obj.modelOrderThreshold = orderThreshold;
+            obj.maxOrder = maxOrder;
+            obj.decimationFactor = decimationFactor;
+        end
+
+        function results = getMUSIC2DEstimation(obj, ofdm)
+            % GETMUSIC2DESTIMATION Estimates distance and velocity through
+            % 2D MUSIC
+            % results = GETMUSIC2DESTIMATION(ofdm) returns the
+            % distance and velocity of scatterers in scenario. 
+            % 
+            % Inputs:
+            %       ofdm                : received grid on sensing receiver
+            % Output:
+            %       results             : Ns x 2 matrix with distance and
+            %                             velocity estimation for Ns
+            %                             scatterers detected. results(i,
+            %                             :) = [distance(Ni), velocity(Ni)]
+            arguments
+                obj
+                ofdm OFDM_ISAC
+            end
+            % select the used resources
+            ofdm.grid = ofdm.grid(1:obj.nSubcarriers, 1:obj.mSymbols);
+            % obtain pseudospectrums in distance and velocity domains
+            music1DResults = obj.music1D(ofdm);
+            % search peaks and match distance and velocity estimations
+            results = obj.getMUSICPeaksDecimated(music1DResults, ofdm);
+        end
+
+        function effBW = getEffectiveBandwidth(obj, ofdmObj)
+            % GETEFFECTIVEBANDWIDTH Gets the bandwidth occupied by the
+            % sensing resources
+            % effBW = GETEFFECTIVEBANDWIDTH(obj, ofdmObj) calculates total
+            % bandwidth
+            % Input:
+            %       ofdmObj : object of the OFDM_ISAC class
+
+            arguments
+                obj 
+                ofdmObj OFDM_ISAC 
+            end
+            effBW = obj.nSubcarriers * ofdmObj.SCS;
+        end
+    end
+    methods (Access = private)
+
+        function music1DResults = music1D(obj, ofdm)
+            % MUSIC1D estimates pseudspectrum for distance and velocity as
+            % well as model order
+            % music1DResults = MUSIC1D(ofdm) returns the pseudospectrums
+            % and model order
+            % Inputs:
+            %       ofdm                : received grid on sensing receiver
+            % Outpur:
+            %       music1DResults      : structure that includes
+            %                             pseudospectrum of distance (Psn), 
+            %                             velocity (Psm) and model order 
+            %                             estimation
+            arguments
+                obj
+                ofdm OFDM_ISAC
+            end
+
+            % get relevant parameteres for ease
+            N = obj.nSubcarriers;
+            M = obj.mSymbols;
+            Ln = obj.lagN;
+            Lm = obj.lagM;
+            dSearchSpace = obj.distanceSearchSpace;
+            vSearchSpace = obj.velocitySearchSpace;
+
+            rx = ofdm.grid;
+            rxT = transpose(ofdm.grid);
+
+            % obtain correlation matrices applying forward-backwards
+            % averaging
+            Sxn = zeros(N-Ln+1);
+            Sxm = zeros(M-Lm+1);
+            for i = 1:M
+                Sxn = Sxn + correlationMatFB(rxT(i, :), Ln);
+            end
+            Sxn = Sxn / M;
+            for i = 1:N
+                Sxm = Sxm + correlationMatFB(rx(i, :), Lm);
+            end
+            Sxm = Sxm / N;
+            
+            % apply SVD to get the null subspace
+            [Un, Pn, ~] = svd(Sxn);
+            orderN = obj.detectModelOrder(diag(Pn));
+            orderN = min(orderN, obj.maxOrder);
+            Un = Un(:, orderN+1:end);                   % noise subspace for rows
+
+            [Um, Pm, ~] = svd(Sxm);
+            orderM = obj.detectModelOrder(diag(Pm));
+            orderM = min(orderM, obj.maxOrder);
+            Um = Um(:, orderM+1:end);                   % noise subspace for columns
+
+            % obtain pseudospectrum for distance
+            N = size(Sxn, 1);
+            Psn = zeros(1, length(dSearchSpace));
+            for i = 1:length(obj.distanceSearchSpace)
+                baseDistance = exp(1j*2*pi*2*dSearchSpace(i)/physconst('LightSpeed')*ofdm.SCS*(0:N-1)');
+                Psn(i) = abs(1/(baseDistance'*(Un*Un')*baseDistance));
+            end
+
+            % obtain pseudospectrum for velocity
+            M = size(Sxm, 1);
+            Psm = zeros(1, length(vSearchSpace));
+            for i = 1:length(obj.distanceSearchSpace)
+                baseVelocity = exp(1j*2*pi*(-2*vSearchSpace(i)*ofdm.fc/physconst('LightSpeed'))/ofdm.SCS*(0:M-1)');
+                Psm(i) = abs(1/(baseVelocity'*(Um*Um')*baseVelocity));
+            end
+
+            % arrange output
+            order = max([orderN, orderM]);
+            music1DResults.Psn = Psn;
+            music1DResults.Psm = Psm;
+            music1DResults.order = order;
+        end
+
+        function Sfb = correlationMatFB(obj, rx, L)
+            % CORRELATIONMATFB Estimates correlation matrix applying
+            % forward-backward (FB) averaging
+            % Sfb = CORRELATIONMATFB(rx, L) returns the correlation matrix
+            % estimate
+            % Inputs:
+            %       rx          : received grid
+            %       L           : length of subarrays for FB averaging
+            % Output:
+            %       Sfb         : correlation matrix estimate
+            N = length(rx);
+            M = N - L + 1;
+            J = obtainExchangeMatrix(M);
+            Sfb = zeros(M);
+            for i = 1:L
+                Xi = rx(i:i:M-1);
+                Sfb = Sfb + (Xi'*Xi + J*transpose(Xi)*conj(Xi)*J);
+            end
+        end
+
+        function ix = detectModelOrder(obj, eigs)
+            % DETECTMODELORDER Estimates model order based on eigenvalues
+            % ix = DETECTMODELORDER(eigs) detects the model order by
+            % separating eigenvalues of signal and noise subspaces
+            % using obj.modelOrderThreshold for decision
+            % Inputs:
+            %       eigs         : eigenvalues
+            % Output:
+            %       ix           : model order estimation
+            ix = 1;
+            while ix < length(eigs) & eigs(ix)/eigs(ix+1) < obj.modelOrderThreshold
+                ix = ix + 1;
+            end
+        end
+        
+        function results = getMUSICPeaksDecimated(obj, music1DResults, ofdm)
+            % GETMUSICPEAKSDECIMATED Detect peaks on pseudspectrums and
+            % returns corresponding distance and velocity estimations
+            % results = GETMUSICPEAKSDECIMATED(music1DResults, ofdm)
+            % Inputs:
+            %       music1DResults  : structure with results from MUSIC1D
+            %       ofdm            : received ofdm grid
+            % Output:
+            %       results             : Ns x 2 matrix with distance and
+            %                             velocity estimation for Ns
+            %                             scatterers detected. results(i,
+            %                             :) = [distance(Ni), velocity(Ni)]
+
+            c0 = physconst('LightSpeed');
+            % reduce samples to avoid high computational costs
+            rx = ofdm.grid(1:obj.decimationFactor:end, :);
+            [N, M] = size(rx);
+            
+            Psn = pow2db(music1DResults.Psn/max(music1DResults.Psn));
+            Psm = pow2db(music1DResults.Psm/max(music1DResults.Psm));
+
+            % search peaks
+            [peaksN, locN] = findpeaks(Psn, 'MinPeakProminence', obj.peakProminence);
+            [peaksM, locM] = findpeaks(Psm, 'MinPeakProminence', obj.peakProminence);
+
+            % if only one peak no need for matching
+            if length(locN) > 1 || length(locM) > 1
+                S2dfb = obj.correlationMat2DFB(rx);
+                N2 = N - obj.FBLn + 1;
+                M2 = M - obj.FBLm + 1;
+                [U2, ~, ~] = svd(S2dfb);
+                U2n = U2(:, music1DResults.order+1:end);
+
+                % compare peaks on each dimension and initialize the
+                % results
+                nPeaksN = length(peaksN);
+                nPeaksM = length(peaksM);
+                musicPeaks = zeros(max(nPeaksN, nPeaksM), 2);
+
+                if nPeaksN > nPeaksM
+                    for i = 1:nPeaksN
+                        maxPeak = -inf;
+                        baseDistance = exp(1j*2*pi*2*obj.distanceSearchSpace(locN(i))/c0*ofdm.SCS*(0:N2-1)');
+                        for k = 1:nPeaksM
+                            baseVelocity = exp(-1j*2*pi*(2*obj.velocitySearchSpace(locM(k))*ofdm.fc/c0)/ofdm.SCS*(0:M2-1));
+                            v2D = reshape(baseDistance*baseVelocity, N2*M2, 1);
+                            Psik = abs(1/(v2D'*(U2n*U2n')*v2D));
+                            if Psik > maxPeak
+                                maxPeak = Psik;
+                                musicPeaks(i, :) = [obj.distanceSearchSpace(locN(i)), obj.velocitySearchSpace(locM(k))];
+                            end
+                        end
+                    end
+                else
+                    for i = 1:nPeaksM
+                        maxPeak = -inf;
+                        baseVelocity = exp(-1j*2*pi*(2*obj.velocitySearchSpace(locM(k))*ofdm.fc/c0)/ofdm.SCS*(0:M2-1));
+                        for k = 1:nPeaksN
+                            baseDistance = exp(1j*2*pi*2*obj.distanceSearchSpace(locN(i))/c0*ofdm.SCS*(0:N2-1)');
+                            v2D = reshape(baseDistance*baseVelocity, N2*M2, 1);
+                            Psik = abs(1/(v2D'*(U2n*U2n')*v2D));
+                            if Psik > maxPeak
+                                maxPeak = Psik;
+                                musicPeaks(i, :) = [obj.distanceSearchSpace(locN(i)), obj.velocitySearchSpace(locM(k))];
+                            end
+                        end
+                    end
+                end
+                results = musicPeaks;                
+            else
+                results = [obj.distanceSearchSpace(locN), obj.velocitySearchSpace(locM)];
+            end
+
+
+        end
+
+        function S2dfb = correlationMat2DFB(obj, rx)
+            % CORRELATIONMAT2DFB Estimates correlation matrix applying
+            % 2D FB averaging
+            % S2dfb = CORRELATIONMAT2DFB(rx)
+            % Inputs:
+            %       rx          : received grid
+            % Output:
+            %       S2dfb       : correlation matrix estimation
+            [N, M] = size(rx);
+            Nl = N - obj.FBLn + 1;
+            Ml = M - obj.FBLm + 1;
+            J = obtainExchangeMatrix(Nl*Ml);
+            S2dfb = zeros(Nl*Ml);
+            for i = 1:obj.FBLn
+                for k = 1:obj.FBLm
+                    rxI = reshape(rx(i:i+Nl-1, k:k+Ml-1), 1, Nl*Ml);
+                    S2dfb = S2dfb + (rxI'*rxI + J*transpose(rxI)*conj(rxI)*J);
+                end
+            end
+            S2dfb = S2dfb/(2*i*k);
+        end
+    end
+end
